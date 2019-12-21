@@ -20,6 +20,7 @@ namespace orc {
 		ExecutionSession ES;
 		RTDyldObjectLinkingLayer ObjectLayer;
 		IRCompileLayer CompileLayer;
+		IRTransformLayer OptimizeLayer;
 
 		DataLayout DL;
 		MangleAndInterner Mangle;
@@ -31,10 +32,11 @@ namespace orc {
 		KaleidoscopeJIT(JITTargetMachineBuilder JTMB, DataLayout DL)
 			:ObjectLayer(ES, [](){ return std::make_unique<SectionMemoryManager>();}),
 			 CompileLayer(ES, ObjectLayer, ConcurrentIRCompiler(std::move(JTMB))),
+			 OptimizeLayer(ES, CompileLayer, optimizeModule),
 			 DL(std::move(DL)),
 			 Mangle(ES, this->DL),
 			 Ctx(std::make_unique<LLVMContext>()),
-			 MainJD(ES.createJITDyliba("<main>"))
+			 MainJD(ES.createJITDylib("<main>"))
 		{
 			 MainJD.addGenerator(
 			 	cantFail(DynamicLibrarySearchGenerator::GetForCurrentProcess(
@@ -68,14 +70,37 @@ namespace orc {
 
 		Error addModule(std::unique_ptr<Module> M)
 		{
-			retrn CompileLayer.add(MainJD, ThreadSafeModule(std::move(M), Ctx));
+			return OptimizeLayer.add(MainJD, ThreadSafeModule(std::move(M), Ctx));
 		}
 
 		Expected<JITEvaluatedSymbol> lookup(StringRef Name)
 		{
 			return ES.lookup({&MainJD}, Mangle(Name.str()));
 		}
-
+	
+	private:
+		static Expected<ThreadSafeModule>
+		optimizeModule(ThreadSafeModule TSM, const MaterializationResponsibility &R)
+		{
+			TSM.withModuleDo([](Module &M){
+				// Create a function pass manager.
+				auto FPM = std::make_unique<legacy::FunctionPassManager>(&M);				
+				
+				FPM->add(createInstructionCombiningPass());
+				FPM->add(createReassociatePass());
+				FPM->add(createGVNPass());
+				FPM->add(createCFGSimplificationPass());
+				
+				FPM->doInitialization();
+				
+				// Run the optimizations over all functions in the module being added to
+				// the JIT.	
+				for (auto &F : M) {
+					FPM->run(F);
+				}
+			});
+			return TSM;
+		}
 	};
 } //end namespace orc
 } //end namespace llvm
