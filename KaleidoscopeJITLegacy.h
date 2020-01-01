@@ -5,7 +5,10 @@
 #ifndef KALEIDOSCOPEJIT_KALEIDOSCOPEJITLEGACY_H
 #define KALEIDOSCOPEJIT_KALEIDOSCOPEJITLEGACY_H
 
+#include "RemoteJITUtils.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Triple.h"
 #include "llvm/ExecutionEngine/ExecutionEngine.h"
 #include "llvm/ExecutionEngine/JITSymbol.h"
 #include "llvm/ExecutionEngine/Orc/CompileUtils.h"
@@ -13,9 +16,8 @@
 #include "llvm/ExecutionEngine/Orc/IRTransformLayer.h"
 #include "llvm/ExecutionEngine/Orc/IndirectionUtils.h"
 #include "llvm/ExecutionEngine/Orc/LambdaResolver.h"
+#include "llvm/ExecutionEngine/Orc/OrcRemoteTargetClient.h"
 #include "llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h"
-#include "llvm/ExecutionEngine/RTDyldMemoryManager.h"
-#include "llvm/ExecutionEngine/SectionMemoryManager.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Mangler.h"
@@ -59,9 +61,13 @@ irgenAndTakeOwnership(FunctionAST &FnAST, const std::string &Suffix);
 
 namespace llvm {
 namespace orc {
+
+// Typedef the remote-client API.
+using MyRemote = remote::OrcRemoteTargetClient;
+
 class KaleidoscopeJIT {
 private:
-	ExecutionSession ES;
+	ExecutionSession &ES;
 	std::shared_ptr<SymbolResolver> Resolver;
 	std::unique_ptr<TargetMachine> TM;
 	const DataLayout DL;
@@ -75,10 +81,12 @@ private:
 
 	std::unique_ptr<JITCompileCallbackManager> CompileCallbackMgr;
 	std::unique_ptr<IndirectStubsManager> IndirectStubsMgr;
+	MyRemote &Remote;
 
 public:
-	KaleidoscopeJIT()
-		: Resolver(createLegacyLookupResolver(
+	KaleidoscopeJIT(ExecutionSession &ES, MyRemote &Remote)
+		: ES(ES),
+		Resolver(createLegacyLookupResolver(
 			ES,
 			[this](const std::string &Name) -> JITSymbol {
 				if (auto Sym = IndirectStubsMgr->findSymbol(Name, false))
@@ -87,30 +95,32 @@ public:
 					return Sym;
 				else if (auto Err = Sym.takeError())
 					return std::move(Err);
-				if (auto SymAddr = RTDyldMemoryManager::getSymbolAddressInProcess(Name))
+				if (auto Addr = canFail(this->Remote.getSymbolAddress(Name)))
 					return JITSymbol(SymAddr, JITSymbolFlags::Exported);
 				return nullptr;
 			},
 			[](Error Err){
 				cantFail(std::move(Err), "lookupFlags failed");
 			})),
-		TM(EngineBuilder().selectTarget()),
+		TM(EngineBuilder().selectTarget(Triple(Remote.getTargetTriple()), "", "", SmallVector<std::string, 0>())),
 		DL(TM->createDataLayout()),
 		ObjectLayer(AcknowledgeORCv1Deprecation, ES,
 						[this](VModuleKey K) {
 							return LegacyRTDyldObjectLinkingLayer::Resources{
-								std::make_shared<SectionMemoryManager>(), Resolver};
+								cantFail(this->Remote.createRemoteMemoryManager()), Resolver};
 						}),
 		CompileLayer(AcknowledgeORCv1Deprecation, ObjectLayer, SimpleCompiler(*TM)),
 		OptimizeLayer(AcknowledgeORCv1Deprecation, CompileLayer,
 						[this](std::unique_ptr<Module> M) {
 							return OptimizeModule(std::move(M));
 						}),
-		CompileCallbackManager(cantFail(orc::createLocalCompileCallbackManager(
-										TM->getTargetTriple(), ES, 0))) {
-			auto IndirectStubsMgrBuilder = 
-					orc::createLocalIndirectStubsManagerBuilder(TM->getTargetTriple());
-			IndirectStubsMgr = IndirectStubsMgrBuilder();
+			Remote(Remote){
+			auto CCMgrOrErr = Remote.enableCompileCallbacks(0);
+			if (!CCMgrOrErr) {
+				logAllUnhandledErrors(CCmgrOrErr.takeError(), errs(), "Error enabling remote compile callbacks:");
+			}
+			CompileCallbackMgr = &*CCMgrOrErr;
+			IndirectStubsMgr = cantFail(Remote.createIndirectStubsManager());
 			llvm::sys::DynamicLibray::LoadLibraryPermanently(nullptr);
 		}
 	
@@ -174,10 +184,15 @@ public:
 		// created. When the compile action for the callback is run we will update the stub's
 		// function pointer to point at the function implementation that we just implemented.
 		if (auto Err = IndirectStubsMgr->createStub(
-						managle(SharedFnAST->getName(), CCAddr, JITSymbolFlags::Exported)))
+						mangle(SharedFnAST->getName(), CCAddr, JITSymbolFlags::Exported)))
 				return Err;
 		
 		return Error::success();
+	}
+
+	Error executeRemoteExpr(JITTargetAddress ExprAddr)
+	{
+		return Remote.callVoidVoid(ExprAddr);
 	}
 
 	JITSymbol findSymbol(const std::string Name)
